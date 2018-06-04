@@ -1,14 +1,14 @@
 from datetime import datetime
 import logging
 import time
+from pathlib import Path
 from typing import List
 
 from ethereum.utils import privtoaddr, denoms
 from eth_utils import encode_hex, is_address, to_checksum_address
 import requests
 
-from golem_sci import new_sci
-from golem_sci.gntconverter import GNTConverter
+from golem_sci import new_sci, GNTConverter
 from golem.config.active import ETHEREUM_CHAIN, ETHEREUM_FAUCET_ENABLED
 from golem.ethereum.node import NodeProcess
 from golem.ethereum.paymentprocessor import PaymentProcessor
@@ -58,6 +58,7 @@ class EthereumTransactionSystem(TransactionSystem):
         self._node = NodeProcess(datadir, start_geth, address)
         self._node.start(start_port)
         self._sci = new_sci(
+            Path(datadir),
             self._node.web3,
             eth_addr,
             lambda tx: tx.sign(node_priv_key),
@@ -65,6 +66,7 @@ class EthereumTransactionSystem(TransactionSystem):
         )
         self._gnt_converter = GNTConverter(self._sci)
         self._faucet = ETHEREUM_FAUCET_ENABLED
+        self._gnt_faucet_requested = False
         self.payment_processor = PaymentProcessor(self._sci)
 
         super().__init__(
@@ -198,7 +200,7 @@ class EthereumTransactionSystem(TransactionSystem):
         if gntb_balance < required:
             raise exceptions.NotEnoughFunds(required, gntb_balance, 'GNTB')
         max_possible_amount = min(expected, gntb_balance)
-        tx_hash = self._sci.deposit_payment(max_possible_amount)  # tx_hash
+        tx_hash = self._sci.deposit_payment(max_possible_amount)
         log.info(
             "Requested concent deposit of %.6fGNT (tx: %r)",
             max_possible_amount / denoms.ether,
@@ -207,18 +209,11 @@ class EthereumTransactionSystem(TransactionSystem):
 
         def transaction_receipt(receipt):
             if not receipt.status:
-                log.critical(
-                    "Deposit failed. Receipt: %r",
-                    receipt,
-                )
+                log.critical("Deposit failed. Receipt: %r", receipt)
                 return
             cb()
 
-        self._sci.on_transaction_confirmed(
-            tx_hash=tx_hash,
-            required_confs=3,
-            cb=transaction_receipt,
-        )
+        self._sci.on_transaction_confirmed(tx_hash, transaction_receipt)
 
     def _get_ether_from_faucet(self) -> None:
         if not self._faucet or not self._balance_known():
@@ -232,9 +227,13 @@ class EthereumTransactionSystem(TransactionSystem):
             return
         if self._eth_balance < 0.001 * denoms.ether:
             return
-        if self._gnt_balance + self._gntb_balance < 100 * denoms.ether:
+        if self._gnt_balance + self._gntb_balance < 100 * denoms.ether and\
+                not self._gnt_faucet_requested:
             log.info("Requesting GNT from faucet")
             self._sci.request_gnt_from_faucet()
+            self._gnt_faucet_requested = True
+        else:
+            self._gnt_faucet_requested = False
 
     def _balance_known(self) -> bool:
         return self._last_eth_update is not None and \
@@ -280,4 +279,4 @@ class EthereumTransactionSystem(TransactionSystem):
                 )
                 self._gnt_converter.convert(self._gnt_balance)
 
-        self.payment_processor.run()
+        self.payment_processor.sendout()
